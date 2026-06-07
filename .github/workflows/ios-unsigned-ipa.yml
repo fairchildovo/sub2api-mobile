@@ -1,0 +1,97 @@
+name: Build unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    runs-on: macos-15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Generate iOS native project
+        run: npx expo prebuild --platform ios --non-interactive
+
+      - name: Install CocoaPods
+        run: |
+          cd ios
+          pod install --repo-update
+
+      - name: Build unsigned app
+        run: |
+          set -euo pipefail
+
+          WORKSPACE="$(find ios -maxdepth 1 -name '*.xcworkspace' -print -quit)"
+          if [ -z "$WORKSPACE" ]; then
+            echo "No Xcode workspace found under ios/."
+            exit 1
+          fi
+
+          SCHEME="$(xcodebuild -list -json -workspace "$WORKSPACE" | ruby -rjson -e 'schemes = JSON.parse(STDIN.read).dig("workspace", "schemes") || []; puts schemes.first')"
+          if [ -z "$SCHEME" ]; then
+            echo "No Xcode scheme found in $WORKSPACE."
+            exit 1
+          fi
+
+          echo "Workspace: $WORKSPACE"
+          echo "Scheme: $SCHEME"
+
+          xcodebuild \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath ios/build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+
+          APP_PATH="$(find ios/build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' -type d -print -quit)"
+          if [ -z "$APP_PATH" ]; then
+            echo "No built .app found under ios/build/Build/Products/Release-iphoneos."
+            exit 1
+          fi
+
+          IPA_NAME="sub2api-mobile-unsigned-${GITHUB_SHA::7}.ipa"
+
+          rm -rf unsigned-ipa
+          mkdir -p unsigned-ipa/Payload
+          cp -R "$APP_PATH" unsigned-ipa/Payload/
+
+          cd unsigned-ipa
+          zip -qry "../$IPA_NAME" Payload
+
+          {
+            echo "## Unsigned iOS IPA"
+            echo ""
+            echo "- Artifact: \`$IPA_NAME\`"
+            echo "- App bundle: \`$(basename "$APP_PATH")\`"
+            echo "- Signing: disabled during xcodebuild"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload unsigned IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sub2api-mobile-unsigned-ipa
+          path: sub2api-mobile-unsigned-*.ipa
