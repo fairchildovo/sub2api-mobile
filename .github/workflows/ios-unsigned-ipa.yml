@@ -2,12 +2,17 @@ name: Build unsigned iOS IPA
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag. Leave empty to use unsigned-ios-${run_number}.
+        required: false
+        type: string
 
 jobs:
   build-ios:
     runs-on: macos-15
     permissions:
-      contents: read
+      contents: write
 
     steps:
       - name: Checkout
@@ -40,14 +45,22 @@ jobs:
             exit 1
           fi
 
-          SCHEME="$(xcodebuild -list -json -workspace "$WORKSPACE" | ruby -rjson -e 'schemes = JSON.parse(STDIN.read).dig("workspace", "schemes") || []; puts schemes.first')"
+          APP_PROJECT="$(find ios -maxdepth 1 -name '*.xcodeproj' ! -name 'Pods.xcodeproj' -print -quit)"
+          if [ -z "$APP_PROJECT" ]; then
+            echo "No app Xcode project found under ios/."
+            exit 1
+          fi
+
+          SCHEME="$(basename "$APP_PROJECT" .xcodeproj)"
           if [ -z "$SCHEME" ]; then
             echo "No Xcode scheme found in $WORKSPACE."
             exit 1
           fi
 
           echo "Workspace: $WORKSPACE"
+          echo "App project: $APP_PROJECT"
           echo "Scheme: $SCHEME"
+          xcodebuild -list -workspace "$WORKSPACE"
 
           xcodebuild \
             -workspace "$WORKSPACE" \
@@ -64,12 +77,23 @@ jobs:
             build
 
       - name: Package unsigned IPA
+        id: package
         run: |
           set -euo pipefail
 
-          APP_PATH="$(find ios/build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' -type d -print -quit)"
+          echo "Build products:"
+          find ios/build/Build/Products -maxdepth 3 -print
+
+          APP_PATH=""
+          while IFS= read -r candidate; do
+            if [ -f "$candidate/Info.plist" ] && [ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$candidate/Info.plist" 2>/dev/null || true)" = "APPL" ]; then
+              APP_PATH="$candidate"
+              break
+            fi
+          done < <(find ios/build/Build/Products -name '*.app' -type d)
+
           if [ -z "$APP_PATH" ]; then
-            echo "No built .app found under ios/build/Build/Products/Release-iphoneos."
+            echo "No built application .app found under ios/build/Build/Products."
             exit 1
           fi
 
@@ -81,6 +105,13 @@ jobs:
 
           cd unsigned-ipa
           zip -qry "../$IPA_NAME" Payload
+          cd ..
+
+          {
+            echo "ipa_name=$IPA_NAME"
+            echo "ipa_path=$IPA_NAME"
+            echo "app_name=$(basename "$APP_PATH")"
+          } >> "$GITHUB_OUTPUT"
 
           {
             echo "## Unsigned iOS IPA"
@@ -95,3 +126,36 @@ jobs:
         with:
           name: sub2api-mobile-unsigned-ipa
           path: sub2api-mobile-unsigned-*.ipa
+
+      - name: Publish IPA to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG_INPUT: ${{ inputs.release_tag }}
+          IPA_PATH: ${{ steps.package.outputs.ipa_path }}
+        run: |
+          set -euo pipefail
+
+          RELEASE_TAG="$RELEASE_TAG_INPUT"
+          if [ -z "$RELEASE_TAG" ]; then
+            RELEASE_TAG="unsigned-ios-${GITHUB_RUN_NUMBER}"
+          fi
+
+          RELEASE_TITLE="Unsigned iOS IPA ${RELEASE_TAG}"
+          RELEASE_NOTES="$(printf 'Unsigned iOS IPA built from %s.\n\nSigning was disabled during xcodebuild. Re-sign this IPA before installing it on non-jailbroken devices.' "$GITHUB_SHA")"
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$IPA_PATH" --clobber
+          else
+            gh release create "$RELEASE_TAG" "$IPA_PATH" \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_TITLE" \
+              --notes "$RELEASE_NOTES"
+          fi
+
+          {
+            echo ""
+            echo "## GitHub Release"
+            echo ""
+            echo "- Tag: \`$RELEASE_TAG\`"
+            echo "- IPA: \`$IPA_PATH\`"
+          } >> "$GITHUB_STEP_SUMMARY"
